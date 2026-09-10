@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>TDR PARK R5.8 · X-LOCK · NO AIRCRAFT SOUND · 5 TRAILS · SV LOCK</title>
+<title>TDR PARK R5.8 · GEUMHO LONG-RANGE CAL R1 · 5 TRAILS · SV LOCK</title>
 <style>
 :root{
   --bg:rgba(0,0,0,0);
@@ -1155,6 +1155,29 @@ const TDR_PARK_VISUAL_RADIAL_SCALE = 1.00; // R5.8 X-LOCK: do not magnify latera
 const TDR_PARK_VISUAL_ORIGIN_Y_NORM = 0.8720;
 const TDR_PARK_VISUAL_150_TARGET_Y_NORM = 0.4500;
 
+/* R5.9B FAR-DEPTH ONLY
+   IMPORTANT:
+   - 0~150m: existing R1 projection is preserved exactly.
+   - >150m: screen-space forward/depth Y only is expanded.
+   - 300m target is the user's red reference line measured from the supplied 1536x1024 screenshot.
+   - No L2/background image is redrawn or modified.
+   - X/side scale, sensor raw values, D2 xyz/carry/total, Grass/Fairway resistance are untouched.
+*/
+const TDR_PARK_FAR_START_M = 150.0;
+const TDR_PARK_FAR_300_TARGET_Y_NORM = 0.4015; // ~411px / 1024 screenshot
+function tdrParkFarDepthY(baseY, localDepthM){
+  const d=Math.max(0,Number(localDepthM)||0);
+  if(d<=TDR_PARK_FAR_START_M) return baseY; // exact R1 through 150m
+
+  const y150=H*TDR_PARK_VISUAL_150_TARGET_Y_NORM;
+  const y300=H*TDR_PARK_FAR_300_TARGET_Y_NORM;
+  const pxPerM=(y300-y150)/(300-TDR_PARK_FAR_START_M);
+
+  // Linear real-distance spacing beyond 150m: 150/200/250/300/350 remain proportional.
+  return y150 + (d-TDR_PARK_FAR_START_M)*pxPerM;
+}
+
+
 function tdrParkVisualOrigin(result){
   const ps=window.TDR_PARK_STATE||{playerX:0,playerY:0};
   return {
@@ -1175,7 +1198,9 @@ function tdrParkL2VisualProject(p,result){
   const pitchGain=(Math.abs(d150)>0.001)?((target150Y-teeOrigin.y)/d150):1.0;
 
   const mappedGroundX=teeOrigin.x+(baseGround.x-projectedOrigin.x)*TDR_PARK_VISUAL_RADIAL_SCALE;
-  const mappedGroundY=teeOrigin.y+(baseGround.y-projectedOrigin.y)*pitchGain;
+  const mappedGroundY_R1=teeOrigin.y+(baseGround.y-projectedOrigin.y)*pitchGain;
+  const localDepth=Math.max(0,(Number(p.x)||0)-origin.x);
+  const mappedGroundY=tdrParkFarDepthY(mappedGroundY_R1,localDepth);
   const rawHeightPx=Math.max(0,baseGround.y-base.y);
 
   return {
@@ -1341,7 +1366,7 @@ function drawGuides(){
   // 방사각 theta에서 world point = (forward=r*cosθ, side=r*sinθ, height=0).
   // 따라서 같은 10m라도 좌/우 각도가 커지면 forward depth가 짧아져
   // PLAYER VIEW에서는 동일 수평선이 아니라 곡선 원호로 투영된다.
-  const ranges=[10,20,30,40,50,100,150,200,250,300];
+  const ranges=[10,20,30,40,50,100,150,200,250,300,350];
   const azimuths=[-45,-30,-20,-10,0,10,20,30,45];
 
   // PARK R5 L2 GUIDE-ONLY calibration.
@@ -1386,8 +1411,11 @@ function drawGuides(){
       ...q,
       // Radial fan width: 2.5x around the centerline.
       x:teeOrigin.x + (q.x-projectedOrigin.x)*TDR_PARK_L2_GUIDE_RADIAL_SCALE,
-      // DOWN-ROTATED L2 depth around fixed 0m; 150m is locked to the background horizon.
-      y:teeOrigin.y + (q.y-projectedOrigin.y)*pitchGain
+      // R1 guide projection is exact through 150m; only >150m screen-depth is expanded.
+      y:tdrParkFarDepthY(
+          teeOrigin.y + (q.y-projectedOrigin.y)*pitchGain,
+          Math.max(0,(Number(p.x)||0)-(Number(ps.playerX)||0))
+        )
     };
   }
 
@@ -1414,7 +1442,7 @@ function drawGuides(){
   for(const deg of azimuths){
     ctx.beginPath();
     let started=false;
-    for(let r=0;r<=300;r+=2){
+    for(let r=0;r<=350;r+=2){
       const q=projectL2Guide(radarGroundPoint(r,deg));
       if(!started){ctx.moveTo(q.x,q.y);started=true;}
       else ctx.lineTo(q.x,q.y);
@@ -1909,6 +1937,7 @@ function animateShot(shot){
   const parkStartX=(window.TDR_PARK_STATE?window.TDR_PARK_STATE.playerX:0);
   const parkStartY=(window.TDR_PARK_STATE?window.TDR_PARK_STATE.playerY:0);
   const result=simulate(shot);
+  tdrApplyGeumhoFlightCalibration(result,shot);
   result._renderPlayerX=parkStartX;
   result._renderPlayerY=parkStartY;
   result.pts=result.pts.map(p=>({...p,x:(Number(p.x)||0)+parkStartX,y:(Number(p.y)||0)+parkStartY}));
@@ -2141,6 +2170,81 @@ function tdrR59ApplyLowRangeCalibration(result){
   return result;
 }
 
+
+/* ===== TDR GEUMHO · LONG-RANGE + ROOM CALIBRATION R1 =====
+   Rules:
+   - Sensor BALL SPEED / LAUNCH / DIRECTION / BACK SPIN / SIDE SPIN remain raw.
+   - Existing low-range calibration remains first.
+   - Automatic long-range carry correction: 60m/s=0%, 80m/s=+6%, linear/smooth between.
+   - Manual DISTANCE: -10..+10% carry-only correction.
+   - Manual SHAPE: FADE(-) .. 0 .. DRAW(+) adds progressive lateral curvature,
+     without changing displayed sensor Direction/SideSpin.
+   - PARK ground resistance is applied AFTER flight calibration and is not changed here.
+*/
+const TDR_GEUMHO_CAL_DEFAULTS = Object.freeze({distance:0, shape:0});
+function tdrLoadGeumhoCal(){
+  try{
+    const v=JSON.parse(localStorage.getItem('TDR_GEUMHO_ROOM_CAL_R1')||'null');
+    if(v) return {
+      distance:Math.max(-10,Math.min(10,Number(v.distance)||0)),
+      shape:Math.max(-10,Math.min(10,Number(v.shape)||0))
+    };
+  }catch(e){}
+  return {...TDR_GEUMHO_CAL_DEFAULTS};
+}
+window.TDR_GEUMHO_ROOM_CAL = tdrLoadGeumhoCal();
+function tdrSaveGeumhoCal(){
+  try{ localStorage.setItem('TDR_GEUMHO_ROOM_CAL_R1',JSON.stringify(window.TDR_GEUMHO_ROOM_CAL)); }catch(e){}
+}
+function tdrLongRangeAutoPct(ballSpeed){
+  const v=Number(ballSpeed);
+  if(!Number.isFinite(v) || v<=60) return 0;
+  if(v>=80) return 6;
+  const q=(v-60)/20;
+  const sm=q*q*(3-2*q); // no step at 60/80
+  return 6*sm;
+}
+function tdrApplyGeumhoFlightCalibration(result, shot){
+  if(!result || !Array.isArray(result.pts) || result.pts.length<2) return result;
+  const rawCarry=Number(result.carry);
+  if(!(rawCarry>0)) return result;
+
+  const autoPct=tdrLongRangeAutoPct(shot&&shot.ball);
+  const manualPct=Math.max(-10,Math.min(10,Number(window.TDR_GEUMHO_ROOM_CAL?.distance)||0));
+  const distanceScale=Math.max(.80, 1 + (autoPct+manualPct)/100);
+
+  // Preserve D2/simulator run length here. Grass/ground resistance remains downstream.
+  const rawTotal=Number(result.total);
+  const rawRun=(Number.isFinite(rawTotal)&&rawTotal>rawCarry)?rawTotal-rawCarry:0;
+
+  // SHAPE unit = 0.75m landing-side correction; progressive curve, zero at launch.
+  const shape= Math.max(-10,Math.min(10,Number(window.TDR_GEUMHO_ROOM_CAL?.shape)||0));
+  const landingSideAdjust=shape*0.75;
+
+  result.rawPreRoomCarry=rawCarry;
+  result.rawPreRoomTotal=rawTotal;
+  result.longRangeAutoPct=autoPct;
+  result.roomDistancePct=manualPct;
+  result.roomShape=shape;
+  result.flightDistanceScale=distanceScale;
+
+  result.pts=result.pts.map(p=>{
+    const x0=Number(p.x)||0;
+    const y0=Number(p.y)||0;
+    const q=Math.max(0,Math.min(1,x0/rawCarry));
+    return {...p, x:x0*distanceScale, y:y0 + landingSideAdjust*Math.pow(q,1.65)};
+  });
+  result.carry=rawCarry*distanceScale;
+  result.total=Number.isFinite(rawTotal)?result.carry+rawRun:rawTotal;
+  if(Number.isFinite(Number(result.side))) result.side=Number(result.side)+landingSideAdjust;
+  return result;
+}
+window.TDR_GEUMHO_LONG_RANGE_DIAG=()=>({
+  room:{...window.TDR_GEUMHO_ROOM_CAL},
+  autoRule:'<=60:0%, 60..80:smooth 0..6%, >=80:6%',
+  grassRoll:window.TDR_PARK_ROLL_RESISTANCE?{...window.TDR_PARK_ROLL_RESISTANCE}:null
+});
+
 function tdrRenderMeasuredLaunch(d){
   const parkStartX=(window.TDR_PARK_STATE?window.TDR_PARK_STATE.playerX:0);
   const parkStartY=(window.TDR_PARK_STATE?window.TDR_PARK_STATE.playerY:0);
@@ -2171,6 +2275,7 @@ function tdrRenderMeasuredLaunch(d){
     descentAngle:tdrNum(d.descentAngle)
   };
   tdrR59ApplyLowRangeCalibration(result);
+  tdrApplyGeumhoFlightCalibration(result,shot);
   // PARK-only render origin lock. SV/D2 values remain unchanged.
   result._renderPlayerX=parkStartX;
   result._renderPlayerY=parkStartY;
@@ -3234,7 +3339,21 @@ window.TDR_R7_L1_LOCK = Object.freeze({
           <button type="button" class="tdr-popup-btn" id="showShotBtn">SHOT DISTRIBUTION</button>
           <button type="button" class="tdr-popup-btn" id="bottomBtn">BALL DATA BAR</button>
           <button type="button" class="tdr-popup-btn" id="envBtn">ENV EFFECTS</button>
-        </div>`};
+        </div>
+        <div class="tdr-park-env-row" style="margin-top:12px">
+          <label for="roomDistanceCal">DISTANCE · 줄임 ↔ 늘림</label>
+          <input id="roomDistanceCal" type="range" min="-10" max="10" step="1" value="${Math.round(window.TDR_GEUMHO_ROOM_CAL?.distance||0)}">
+          <b class="tdr-park-env-val" id="roomDistanceCalVal">${(window.TDR_GEUMHO_ROOM_CAL?.distance||0)>0?'+':''}${Math.round(window.TDR_GEUMHO_ROOM_CAL?.distance||0)}%</b>
+        </div>
+        <div class="tdr-park-env-row">
+          <label for="roomShapeCal">FADE ← 좌우보정 → DRAW</label>
+          <input id="roomShapeCal" type="range" min="-10" max="10" step="1" value="${Math.round(window.TDR_GEUMHO_ROOM_CAL?.shape||0)}">
+          <b class="tdr-park-env-val" id="roomShapeCalVal">${(window.TDR_GEUMHO_ROOM_CAL?.shape||0)>0?'+':''}${Math.round(window.TDR_GEUMHO_ROOM_CAL?.shape||0)}</b>
+        </div>
+        <div class="tdr-park-env-actions">
+          <button type="button" class="tdr-popup-btn" id="roomCalReset">CALIBRATION 0 / 0</button>
+        </div>
+        <div class="tdr-park-env-note">센서 원본값은 유지. 거리/좌우는 비구선·착탄 결과에만 적용되며 방별로 이 PC에 저장됩니다.</div>`};
     }
     if(action === 'environment'){
       const rr=window.TDR_PARK_ROLL_RESISTANCE||TDR_PARK_ROLL_DEFAULTS;
@@ -3303,6 +3422,25 @@ window.TDR_R7_L1_LOCK = Object.freeze({
     });
     win.querySelector('#envBtn')?.addEventListener('click',()=>{
       openPopup('environment');
+    });
+    const roomDist=win.querySelector('#roomDistanceCal');
+    const roomShape=win.querySelector('#roomShapeCal');
+    function applyRoomCal(){
+      if(roomDist) window.TDR_GEUMHO_ROOM_CAL.distance=Math.max(-10,Math.min(10,Number(roomDist.value)||0));
+      if(roomShape) window.TDR_GEUMHO_ROOM_CAL.shape=Math.max(-10,Math.min(10,Number(roomShape.value)||0));
+      const dv=win.querySelector('#roomDistanceCalVal');
+      const sv=win.querySelector('#roomShapeCalVal');
+      if(dv){ const n=window.TDR_GEUMHO_ROOM_CAL.distance; dv.textContent=(n>0?'+':'')+Math.round(n)+'%'; }
+      if(sv){ const n=window.TDR_GEUMHO_ROOM_CAL.shape; sv.textContent=(n>0?'+':'')+Math.round(n); }
+      tdrSaveGeumhoCal();
+      showToast(`CAL · DIST ${window.TDR_GEUMHO_ROOM_CAL.distance>0?'+':''}${window.TDR_GEUMHO_ROOM_CAL.distance}% · SHAPE ${window.TDR_GEUMHO_ROOM_CAL.shape>0?'+':''}${window.TDR_GEUMHO_ROOM_CAL.shape}`);
+    }
+    roomDist?.addEventListener('input',applyRoomCal);
+    roomShape?.addEventListener('input',applyRoomCal);
+    win.querySelector('#roomCalReset')?.addEventListener('click',()=>{
+      if(roomDist) roomDist.value='0';
+      if(roomShape) roomShape.value='0';
+      applyRoomCal();
     });
     const fw=win.querySelector('#parkFairwayRoll');
     const gr=win.querySelector('#parkGrassRoll');
@@ -3651,5 +3789,19 @@ window.TDR_PARK_R5_2_GUIDE_CAL = Object.freeze({
   scope:"L2 guides only; 0m fixed; 50m screenshot-calibrated downward rotation; lateral X x1.00; project()/physics/L1/L4 untouched"
 });
 </script>
+
+<script id="tdr-r59b-far-depth-only-diag">
+window.TDR_R59B_FAR_DEPTH_ONLY = Object.freeze({
+  basis:"user supplied 1536x1024 screenshot",
+  unchangedRange:"0..150m EXACT R1 projection",
+  changedRange:">150m screen-depth Y only",
+  y150Norm:0.4500,
+  y300RedNorm:0.4015,
+  spacing:"linear 150/200/250/300/350 by real distance",
+  noImageRedraw:true,
+  locked:["background/L4","L3 effects","sensor raw","D2 xyz","carry/total","X/side scale","Grass/Fairway resistance","calibration UI"]
+});
+</script>
+
 </body>
 </html>
